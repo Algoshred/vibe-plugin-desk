@@ -7,6 +7,7 @@ import createPluginDefault, {
   createPlugin,
   DESK_PROVIDERS,
   DeskManager,
+  type DeskKillService,
   DeskRemote,
 } from "../index.js";
 import { fakeHost, tempDir } from "./helpers.js";
@@ -57,6 +58,11 @@ describe("vibe-plugin-desk", () => {
     expect(manager).toBeInstanceOf(DeskManager);
     // The bridge commands (BOFF-16560) reach the safety-checked service.
     expect(h.services.get("desk/remote")).toBeInstanceOf(DeskRemote);
+    // A provider's own stop control presses the kill switch.
+    const kill = h.services.get("desk/kill") as DeskKillService;
+    kill.kill("macos-menu");
+    expect((manager as DeskManager).killSwitchEngaged).toBe(true);
+    kill.kill("Not A Label!");
     expect(telemetry).toContain("desk.meta.ready");
     expect((await (manager as DeskManager).health()).ready).toBe(true);
 

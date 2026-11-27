@@ -50,6 +50,20 @@ import { createDeskRoutes } from "./routes.js";
 import { DeskSafety, SESSION_FILE } from "./safety.js";
 
 const PLUGIN_NAME = "desk";
+
+/** The `desk`/`kill` service: lets a desk provider press the kill switch. */
+export interface DeskKillService {
+  kill(source: string): void;
+}
+
+const KILL_SOURCE_RE = /^[a-z0-9][a-z0-9._-]{0,39}$/;
+
+/** A short, safe label for the audit trail; anything else becomes "provider". */
+function killSource(source: unknown): string {
+  return typeof source === "string" && KILL_SOURCE_RE.test(source)
+    ? source
+    : "provider";
+}
 const PLUGIN_PACKAGE_NAME = "@vibecontrols/vibe-plugin-desk";
 const PLUGIN_VERSION = getPluginVersion();
 
@@ -130,6 +144,18 @@ export const createPlugin: VibePluginFactory = (
         PLUGIN_NAME,
         "remote",
         remote,
+      );
+      // Providers with their own stop control (the macOS menu bar item and
+      // hotkey) press the kill switch here. Only pressing is offered:
+      // releasing it stays with the person (CLI or the owner-authenticated
+      // HTTP route).
+      const kill: DeskKillService = {
+        kill: (source) => safety.kill(killSource(source)),
+      };
+      hostServices.serviceRegistry?.registerService?.(
+        PLUGIN_NAME,
+        "kill",
+        kill,
       );
     },
     onShutdown: (context?: PluginStopContext) => {
