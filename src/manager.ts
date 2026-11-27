@@ -19,6 +19,7 @@ import { join } from "node:path";
 
 import type { HostServices } from "@vibecontrols/plugin-sdk/contract";
 import {
+  type DeskAction,
   type DeskActionType,
   type DeskActRequest,
   type DeskActResult,
@@ -51,6 +52,33 @@ interface DeskServiceRegistry {
   listProvidersForType?(
     type: string,
   ): string[] | Array<{ pluginName: string; isDefault: boolean }>;
+}
+
+/** The application a desktop action lands in (B4.6 app allow list). */
+export interface DeskAppInfo {
+  /** Display name, e.g. "Safari". */
+  name: string;
+  /** Platform id when there is one: macOS bundle id, Windows exe, X11 WM_CLASS. */
+  bundleId?: string;
+}
+
+/** What the "Steward in control" indicator shows; null hides it. */
+export interface DeskIndicatorState {
+  stewardId: string;
+  stewardName: string;
+  /** ISO time the session started. */
+  since: string;
+}
+
+/**
+ * Optional hooks a desk provider implements on top of `DeskBackend` for
+ * own-machine safety (BOFF-16567). Desktop providers report the frontmost
+ * app, so the app allow list can be enforced, and draw the on-screen
+ * "Steward in control" indicator.
+ */
+export interface DeskSafetyHooks {
+  activeApp?(signal: AbortSignal): Promise<DeskAppInfo | null>;
+  showIndicator?(state: DeskIndicatorState | null): void;
 }
 
 export interface DeskProviderInfo {
@@ -98,6 +126,14 @@ export class DeskManager {
   private consent = false;
   private killed = false;
   private stopped = false;
+  // Kill switch pressed through the own-machine safety layer (CLI, HTTP).
+  private localKill = false;
+  // Aborted by the kill switch: every action in flight stops at once.
+  private epoch = new AbortController();
+  // Per-call cancellation from the caller (the bridge request). The guard
+  // passes the request's action object through to the backend unchanged, so
+  // the action identifies the call.
+  private readonly callerSignals = new WeakMap<DeskAction, AbortSignal>();
 
   constructor(private readonly options: DeskManagerOptions) {}
 
@@ -137,6 +173,70 @@ export class DeskManager {
         ? { pluginName: entry, isDefault: false }
         : entry,
     );
+  }
+
+  private hooksOf(pluginName: string): DeskSafetyHooks | undefined {
+    return this.backendOf(pluginName) as
+      (DeskBackend & DeskSafetyHooks) | undefined;
+  }
+
+  /** The provider's kind ("browser", "x11", "macos", …), if it is registered. */
+  kindOf(pluginName: string): string | undefined {
+    return this.backendOf(pluginName)?.kind;
+  }
+
+  /**
+   * The app in front on that provider's desk. Undefined when the provider
+   * cannot tell (it does not implement `activeApp`), null when no app is in
+   * front.
+   */
+  async activeApp(
+    pluginName: string,
+    signal: AbortSignal,
+  ): Promise<DeskAppInfo | null | undefined> {
+    const hooks = this.hooksOf(pluginName);
+    if (typeof hooks?.activeApp !== "function") return undefined;
+    return hooks.activeApp(signal);
+  }
+
+  /** Show or hide the "Steward in control" indicator on every provider. */
+  showIndicator(state: DeskIndicatorState | null): void {
+    for (const { pluginName } of this.entries()) {
+      const hooks = this.hooksOf(pluginName);
+      if (typeof hooks?.showIndicator !== "function") continue;
+      try {
+        hooks.showIndicator(state);
+      } catch (err) {
+        this.options.logger?.warn(
+          `desk provider ${pluginName} could not update the indicator: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+  }
+
+  /**
+   * Press the kill switch: refuse every new action and abort every action in
+   * flight now. A backend that ignores its signal is answered KILL_SWITCH
+   * without waiting for it.
+   */
+  engageKillSwitch(): void {
+    this.localKill = true;
+    const previous = this.epoch;
+    this.epoch = new AbortController();
+    previous.abort();
+  }
+
+  releaseKillSwitch(): void {
+    this.localKill = false;
+  }
+
+  get killSwitchEngaged(): boolean {
+    return this.localKill || this.killed;
+  }
+
+  /** The `desk.kill-switch` config key alone, as of the last refresh. */
+  get configKillSwitch(): boolean {
+    return this.killed;
   }
 
   private backendOf(pluginName: string): DeskBackend | undefined {
@@ -216,28 +316,73 @@ export class DeskManager {
       get actions() {
         return live()?.actions ?? [];
       },
-      act(action, context): Promise<DeskBackendResult> {
+      act: (action, context): Promise<DeskBackendResult> => {
         const backend = live();
         if (!backend)
           return Promise.reject(
             new Error(`desk provider '${pluginName}' is gone`),
           );
-        return backend.act(action, context);
+        return this.runCancellable(backend, action, context);
       },
     };
     const guard = createDeskGuard(indirection, {
       workspaceFolder: folder,
       consentGranted: () => this.consent,
-      killSwitchEngaged: () => this.killed,
+      killSwitchEngaged: () => this.killSwitchEngaged,
     });
     this.guards.set(pluginName, guard);
     return guard;
+  }
+
+  /**
+   * Run the backend with the kill switch and the caller's signal wired in.
+   * Resolves as soon as either fires, even if the backend ignores its signal.
+   */
+  private runCancellable(
+    backend: DeskBackend,
+    action: DeskAction,
+    context: Parameters<DeskBackend["act"]>[1],
+  ): Promise<DeskBackendResult> {
+    const epoch = this.epoch.signal;
+    const caller = this.callerSignals.get(action);
+    const signals = [context.signal, epoch, ...(caller ? [caller] : [])];
+    const signal = AbortSignal.any(signals);
+    if (epoch.aborted) {
+      return Promise.resolve(killed());
+    }
+    let onAbort: (() => void) | undefined;
+    const cancelled = new Promise<DeskBackendResult>((resolve) => {
+      onAbort = () =>
+        resolve(
+          epoch.aborted
+            ? killed()
+            : {
+                ok: false,
+                error: {
+                  code: "TIMEOUT",
+                  message: "the request was cancelled",
+                },
+              },
+        );
+      epoch.addEventListener("abort", onAbort, { once: true });
+      caller?.addEventListener("abort", onAbort, { once: true });
+    });
+    return Promise.race([
+      backend.act(action, { ...context, signal }),
+      cancelled,
+    ]).finally(() => {
+      if (onAbort) {
+        epoch.removeEventListener("abort", onAbort);
+        caller?.removeEventListener("abort", onAbort);
+      }
+    });
   }
 
   /** Run one action on a desk. Never throws for desk-level failures. */
   async act(
     request: DeskActRequest,
     provider?: string,
+    options: { signal?: AbortSignal } = {},
   ): Promise<DeskActResult> {
     if (this.stopped) {
       return {
@@ -248,6 +393,7 @@ export class DeskManager {
     }
     const pluginName = await this.resolveProviderName(provider);
     await this.refreshSafety();
+    if (options.signal) this.callerSignals.set(request.action, options.signal);
     const result = await this.guardFor(pluginName).act(request);
     // Audit the decision, never the payload: no typed text, file content,
     // command or screenshot leaves through the audit log.
@@ -290,8 +436,15 @@ export class DeskManager {
     return {
       ready: Boolean(this.folder) && !this.stopped,
       remoteControl: this.consent,
-      killSwitch: this.killed,
+      killSwitch: this.killSwitchEngaged,
       providers: this.entries().length,
     };
   }
+}
+
+function killed(): DeskBackendResult {
+  return {
+    ok: false,
+    error: { code: "KILL_SWITCH", message: "the kill switch was pressed" },
+  };
 }

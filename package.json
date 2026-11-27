@@ -75,6 +75,7 @@
     "dist/**/*",
     "!dist/**/*.map",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "vibe-plugin.sig.json"
   ]
 }

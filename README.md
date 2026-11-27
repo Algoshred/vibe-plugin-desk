@@ -36,16 +36,44 @@ Set these with `vibe config set <key> <value>`:
 | `desk.workspace-folder` | `<profile data dir>/desk-workspace` | The only folder file and shell actions may use. Read at start. |
 | `desk.default-provider` | the elected provider                | The provider used when a request names none                    |
 
+## Own-machine safety
+
+When BotManor drives this machine over the agent bridge (`desk.act`, `desk.fence` and `desk.health` commands), every action goes through the `desk` / `remote` service. On top of `desk.remote-control`, that service enforces:
+
+- **Local consent.** A Steward acts only after the person at the machine approved it, for the grant it asked with. A request from a Steward that is not approved, or whose grant id or version changed, is refused with `LOCAL_CONSENT_OFF` and listed as waiting. Nothing that arrives over the bridge can approve anything.
+- **App allow list.** On a desktop desk, the app an action targets and the app in front must both be among the apps the person approved for that Steward. Otherwise the action is refused (`LOCAL_CONSENT_OFF`) and audited as `desk.app.refused`. A provider that cannot report the app in front gets no actions, except file and shell actions confined to the workspace folder. The managed browser desk is exempt: it is the one app.
+- **Steward in control.** The first accepted action starts a session. Providers that implement `showIndicator` draw it on screen, `vibe desk status` and `GET /api/desk/session` show it, and the server gets a `desk.session` `started` event. Only one Steward is in control at a time. The session ends after 5 minutes without an action, when consent is withdrawn, or when the kill switch is pressed, and the server gets `desk.session` `ended` with the reason.
+- **Kill switch.** `vibe desk kill` (or `POST /api/desk/kill`) aborts every action in flight at once and refuses all new ones. It also withdraws every approval, so after `vibe desk resume` each Steward needs a new approval. The daemon checks for a kill switch pressed from another process every 250 ms.
+
+The person manages this from the machine:
+
+```bash
+vibe desk status                                   # who is in control, kill switch, approvals
+vibe desk consent approve <stewardId> --apps "Safari,Notes"
+vibe desk consent revoke <stewardId>
+vibe desk kill
+vibe desk resume
+```
+
+Decisions are kept in `desk-consent.json` (mode 0600) in the profile data directory. A damaged file reads as "kill switch engaged, nothing approved".
+
+`desk.act` payload over the bridge: the `POST /act` body below plus `"steward": { "id", "name", "grantId", "grantVersion", "apps": [...] }`.
+
 ## HTTP API
 
 The agent mounts these routes under `/api/desk`, behind its own authentication:
 
-| Route            | Purpose                                                         |
-| ---------------- | --------------------------------------------------------------- |
-| `GET /providers` | Registered providers, their kind, and the actions each supports |
-| `GET /health`    | Readiness, remote control and kill switch state                 |
-| `POST /act`      | Run one action                                                  |
-| `POST /fence`    | Raise a desk's fence after a takeover                           |
+| Route                              | Purpose                                                         |
+| ---------------------------------- | --------------------------------------------------------------- |
+| `GET /providers`                   | Registered providers, their kind, and the actions each supports |
+| `GET /health`                      | Readiness, remote control and kill switch state                 |
+| `POST /act`                        | Run one action                                                  |
+| `POST /fence`                      | Raise a desk's fence after a takeover                           |
+| `GET /session`                     | The Steward in control, or `null`                               |
+| `GET /consent`                     | Approvals, pending requests and kill switch                     |
+| `POST /consent/:stewardId/approve` | Approve a pending request (`{ "apps"?: [...] }`)                |
+| `POST /consent/:stewardId/revoke`  | Withdraw an approval                                            |
+| `POST /kill` / `POST /resume`      | Press or release the kill switch                                |
 
 `POST /act` body:
 
@@ -94,6 +122,8 @@ export function createPlugin() {
   };
 }
 ```
+
+A desktop provider should also implement the optional `DeskSafetyHooks`: `activeApp(signal)` returns the app in front (`{ name, bundleId? }`), so the app allow list can be enforced, and `showIndicator(state)` shows or hides the on-screen "Steward in control" indicator. A provider should check the app in front again right before it injects input, because focus can change between the meta's check and the action.
 
 ## Development
 
