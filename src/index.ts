@@ -16,12 +16,15 @@
  * enforced once, here, and not re-implemented by each provider.
  *
  * Remote control is OFF until the machine's owner runs
- * `vibe config set desk.remote-control on`. These config keys are the first
- * consent and kill-switch inputs; the full own-machine safety UX (consent
- * prompt, "Steward in control" indicator, app allow list) is BOFF-16567.
+ * `vibe config set desk.remote-control on`. On top of that master switch,
+ * own-machine safety (BOFF-16567, `safety.ts`) asks the person to approve
+ * each Steward and grant (`vibe desk consent approve`), limits it to the apps
+ * they allowed, shows who is in control, and gives them a kill switch
+ * (`vibe desk kill`).
  *
- * Other plugins (the agent bridge command channel, B4.1) reach the manager
- * in process as the `desk` / `manager` service.
+ * Other plugins reach the manager in process as the `desk` / `manager`
+ * service. The agent's bridge commands (B4.1) call the `desk` / `remote`
+ * service, which runs every action through the safety checks.
  */
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join as joinPath } from "node:path";
@@ -39,10 +42,28 @@ import { createLifecycleHooks } from "@vibecontrols/plugin-sdk/lifecycle";
 import { BoundLogger } from "@vibecontrols/plugin-sdk/log";
 import { provisionMetaProviders } from "@vibecontrols/plugin-sdk/providers";
 
+import { type CliCommand, registerDeskCommands } from "./cli.js";
+import { ConsentStore } from "./consent.js";
 import { DeskManager } from "./manager.js";
+import { DeskRemote } from "./remote.js";
 import { createDeskRoutes } from "./routes.js";
+import { DeskSafety, SESSION_FILE } from "./safety.js";
 
 const PLUGIN_NAME = "desk";
+
+/** The `desk`/`kill` service: lets a desk provider press the kill switch. */
+export interface DeskKillService {
+  kill(source: string): void;
+}
+
+const KILL_SOURCE_RE = /^[a-z0-9][a-z0-9._-]{0,39}$/;
+
+/** A short, safe label for the audit trail; anything else becomes "provider". */
+function killSource(source: unknown): string {
+  return typeof source === "string" && KILL_SOURCE_RE.test(source)
+    ? source
+    : "provider";
+}
 const PLUGIN_PACKAGE_NAME = "@vibecontrols/vibe-plugin-desk";
 const PLUGIN_VERSION = getPluginVersion();
 
@@ -103,19 +124,42 @@ export const createPlugin: VibePluginFactory = (
 ): VibePlugin => {
   const log = new BoundLogger(ctx.logger, PLUGIN_NAME);
   const manager = new DeskManager({ dataDir: ctx.dataDir, logger: log });
+  const store = new ConsentStore(ctx.dataDir);
+  const sessionFile = joinPath(ctx.dataDir, SESSION_FILE);
+  const safety = new DeskSafety({ store, manager, logger: log, sessionFile });
+  const remote = new DeskRemote(manager, safety);
 
   const lifecycle = createLifecycleHooks({
     name: PLUGIN_NAME,
     telemetryEventName: "desk.meta.ready",
     onInit: async (hostServices: HostServices) => {
       await manager.init(hostServices);
+      safety.start(hostServices);
       hostServices.serviceRegistry?.registerService?.(
         PLUGIN_NAME,
         "manager",
         manager,
       );
+      hostServices.serviceRegistry?.registerService?.(
+        PLUGIN_NAME,
+        "remote",
+        remote,
+      );
+      // Providers with their own stop control (the macOS menu bar item and
+      // hotkey) press the kill switch here. Only pressing is offered:
+      // releasing it stays with the person (CLI or the owner-authenticated
+      // HTTP route).
+      const kill: DeskKillService = {
+        kill: (source) => safety.kill(killSource(source)),
+      };
+      hostServices.serviceRegistry?.registerService?.(
+        PLUGIN_NAME,
+        "kill",
+        kill,
+      );
     },
     onShutdown: (context?: PluginStopContext) => {
+      safety.stop();
       manager.stop();
       log.info(`desk manager stopped (${context?.reason ?? "shutdown"})`);
     },
@@ -135,7 +179,12 @@ export const createPlugin: VibePluginFactory = (
     metaProviders: DESK_PROVIDERS,
     provisionProviders: (hostServices: HostServices) =>
       provisionMetaProviders(hostServices, DESK_PROVIDERS),
-    createRoutes: () => createDeskRoutes(manager),
+    createRoutes: () => createDeskRoutes(manager, safety),
+    onCliSetup: (program: unknown) => {
+      // The agent passes its commander program; only the methods in
+      // CliCommand are used.
+      registerDeskCommands(program as CliCommand, store, sessionFile);
+    },
     onServerStart: lifecycle.onServerStart,
     onServerStop: lifecycle.onServerStop,
   };
@@ -145,10 +194,26 @@ export default createPlugin;
 
 export { DESK_LIMITS, parseDeskAction, parseDeskTarget } from "./actions.js";
 export {
+  CONSENT_FILE,
+  ConsentError,
+  ConsentStore,
+  type StewardRef,
+} from "./consent.js";
+export { DeskRemote, DeskRemoteError, parseSteward } from "./remote.js";
+export {
+  DESK_SESSION_TOPIC,
+  DeskSafety,
+  type DeskSessionEvent,
+  SAFETY_LIMITS,
+} from "./safety.js";
+export {
   DESK_CONFIG,
   DESK_PROVIDER_TYPE,
+  type DeskAppInfo,
+  type DeskIndicatorState,
   DeskManager,
   DeskManagerError,
   type DeskProviderInfo,
+  type DeskSafetyHooks,
   isDeskBackend,
 } from "./manager.js";

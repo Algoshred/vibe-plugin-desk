@@ -7,6 +7,8 @@ import createPluginDefault, {
   createPlugin,
   DESK_PROVIDERS,
   DeskManager,
+  type DeskKillService,
+  DeskRemote,
 } from "../index.js";
 import { fakeHost, tempDir } from "./helpers.js";
 
@@ -54,12 +56,35 @@ describe("vibe-plugin-desk", () => {
     await p.onServerStart?.(undefined, host);
     const manager = h.services.get("desk/manager");
     expect(manager).toBeInstanceOf(DeskManager);
+    // The bridge commands (BOFF-16560) reach the safety-checked service.
+    expect(h.services.get("desk/remote")).toBeInstanceOf(DeskRemote);
+    // A provider's own stop control presses the kill switch.
+    const kill = h.services.get("desk/kill") as DeskKillService;
+    kill.kill("macos-menu");
+    expect((manager as DeskManager).killSwitchEngaged).toBe(true);
+    kill.kill("Not A Label!");
     expect(telemetry).toContain("desk.meta.ready");
     expect((await (manager as DeskManager).health()).ready).toBe(true);
 
     await p.onServerStop?.({ reason: "shutdown" });
     expect((await (manager as DeskManager).health()).ready).toBe(false);
     await p.onServerStop?.();
+  });
+
+  it("adds the vibe desk commands to the CLI", () => {
+    const names: string[] = [];
+    const command = {
+      command: (name: string) => {
+        names.push(name);
+        return command;
+      },
+      description: () => command,
+      option: () => command,
+      action: () => command,
+    };
+    plugin().onCliSetup?.(command, {});
+    expect(names).toContain("desk");
+    expect(names).toContain("approve <stewardId>");
   });
 
   it("provisions no provider when none is a platform default", async () => {
